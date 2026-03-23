@@ -1,98 +1,238 @@
-# Global-Scale Payment Orchestration Platform (Phase 3)
+# Advanced Fault-Tolerant Payment Orchestration Platform
 
-## 1. Global Multi-Region Architecture (Active-Active)
-To achieve $\geq$ 99.999% availability globally, we utilize fundamentally resilient dispersed networking models:
-- Clusters are completely isolated across macro **Regions** (e.g., US-East, EU-West, AP-South).
-- **Active-Active Topology:** All traffic dynamically resolves via Geo-DNS (e.g., AWS Route53) to the healthiest and geographically closest region.
-- **Global Data Replication:**
-  - **Payment State:** CockroachDB / Google Spanner serves as the baseline providing strictly consistent, globally distributed state transactions leveraging Paxos/Raft.
-  - **Global Idempotency Layer:** Redis Enterprise (Active-Active CRDTs) blocks cross-region replay loops. If US-East processes request `idemp_abc`, EU-West instantly knows.
+## 1. Service Decomposition & Updated HLD
+
+To isolate failure domains and scale components independently, the monolithic structure is formally decomposed into 5 dedicated microservices:
+
+1. **Payment Service:** Manages the core payment lifecycle, enforces the strict payment state machine, and handles client ingress/egress.
+2. **Routing Service:** Calculates optimal provider routes in real-time based on success rates, latency, and cost configurations.
+3. **Webhook Service:** Provides edge reliability. Validates signatures, prevents replay attacks, stores raw payloads, and ensures idempotent consumption.
+4. **Ledger Service (Critical):** Fully isolated append-only financial system of truth.
+5. **Reconciliation Service:** Scheduled CRON jobs that ingest provider settlement reports and detect discrepancies against the internal ledger.
 
 ```mermaid
 graph TD
-    Client --> GeoDNS[Global Geo DNS]
-    GeoDNS --> USEast[US-East Region (API + Svc)]
-    GeoDNS --> EUWest[EU-West Region (API + Svc)]
+    Client --> APIGateway[API Gateway]
+    APIGateway --> PaymentService
+    APIGateway --> WebhookService
     
-    USEast <--> |Global Spanner Replication| GlobalDB[(Distributed SQL - Spanner/Cockroach)]
-    EUWest <--> |Global Spanner Replication| GlobalDB
+    PaymentService <--> RoutingService
+    RoutingService --> Stripe
+    RoutingService --> Razorpay
     
-    USEast <--> |CRDT Sync| RedisGlobal[(Global Redis / Idempotency)]
-    EUWest <--> |CRDT Sync| RedisGlobal
+    WebhookService --> Kafka((Kafka))
+    WebhookService -.-> WebhookDB[(Raw Webhooks DB)]
     
-    USEast --> StripeUS[Stripe US]
-    EUWest --> AdyenEU[Adyen EU]
+    Kafka --> PaymentService
+    Kafka --> LedgerService
+    Kafka --> ReconciliationService
+    
+    PaymentService -.-> PaymentDB[(Payment DB)]
+    LedgerService -.-> LedgerDB[(Append-Only Ledger DB)]
+    ReconciliationService -.-> ReconDB[(Reconciliation DB)]
+    RoutingService -.-> Redis[(Metrics Cache)]
+    
+    ReconciliationService -.-> Stripe[(Stripe Reports)]
 ```
 
-## 2. Settlement & Payout System (Deep Dive)
-Payments are now abstracted far beyond simple REST captures into protracted, complex financial settlement lifecycles: 
-**`AUTHORIZED` $\rightarrow$ `CAPTURED` $\rightarrow$ `SETTLED` $\rightarrow$ `PAID_OUT`**.
+## 2. Consistency Model & Justification
 
-1. **CAPTURE:** Authorized funds are locked efficiently via Payment Providers.
-2. **SETTLE:** Providers (Stripe) implicitly deposit the aggregate batched funds into our Corporate Bank Account (usually $T+2$ days length). The internal `ReconciliationService` verifies the physical bank deposit asynchronously and marks related ledger entries firmly as `SETTLED`.
-3. **PAYOUT:** A dedicated **Payout Service** reads `SETTLED` ledger lines partitioned strictly by merchant. It mathematically aggregates the net balance minus platform fees, issues an ACH/Wire transfer to the merchant, and finally transitions the accounts to `PAID_OUT`.
+- **Strong Consistency (Ledger DB):** Financial transactions demand ACID guarantees. All journal entries for a single transaction must be committed inside a single atomic relational transaction. We cannot afford eventual consistency when recording debits/credits.
+- **Eventual Consistency (Events via Kafka):** Status updates from external providers (Webhooks) traverse Kafka to update the `Payment DB`. This allows the system to remain highly available and absorb traffic spikes without locking core databases.
+- **Anti-Entropy (Reconciliation):** The Reconciliation Service acts as the final consistency net, ensuring that even if Kafka drops an event or a bug skips a webhook, the provider's end-of-day truth cleanly matches our internal Ledger.
+
+## 3. Webhook Reliability Layer
+
+- **Replay Protection:** We store the `provider_event_id` in the `webhook_events` table with a UNIQUE constraint. If Stripe sends the same webhook twice, the DB rejects the duplicate automatically.
+- **Raw Storage:** `webhook_events` stores the exact raw JSON string alongside parsed data. This is crucial for debugging, auditing, and playing back events in case of catastrophic downstream failures.
+- **Out-of-Order Handling:** Webhooks can arrive out of order (e.g., `charge.captured` arriving before `charge.authorized`). The system handles this via the **Payment State Machine**, storing pending events if prerequisites aren't met, or gracefully jumping states if logical (e.g., accepting capture and implicitly inferring authorization).
+
+## 4. Low-Level Design (LLD)
+
+### Payment State Machine (LLD)
+
+**Valid States:** `CREATED` $\rightarrow$ `AUTHORIZED` $\rightarrow$ `CAPTURED` $\rightarrow$ `REFUNDED`. Terminal: `FAILED`.
+
+```java
+public enum PaymentEvent {
+    AUTHORIZATION_SUCCESS, AUTHORIZATION_FAILED, CAPTURE_SUCCESS, REFUND_INITIATED, REFUND_SUCCESS;
+}
+
+public class PaymentStateMachine {
+    // Transition Table mapping (CurrentState, Event) -> NextState
+    public PaymentState transition(PaymentState current, PaymentEvent event) {
+        if (current == PaymentState.CREATED && event == PaymentEvent.AUTHORIZATION_SUCCESS) return PaymentState.AUTHORIZED;
+        if (current == PaymentState.AUTHORIZED && event == PaymentEvent.CAPTURE_SUCCESS) return PaymentState.CAPTURED;
+        if (current == PaymentState.CAPTURED && event == PaymentEvent.REFUND_SUCCESS) return PaymentState.REFUNDED;
+        
+        throw new InvalidStateException("Invalid transition from " + current + " via " + event);
+    }
+}
+```
+
+### Immutable Double-Entry Ledger (LLD)
+
+**CRITICAL RULE:** We NEVER update account balances explicitly. An account's balance is purely the aggregate sum of its immutable journal entries over time.
+
+```java
+@Transactional
+public void recordTransaction(UUID transactionId, List<JournalEntry> entries) {
+    long totalCredits = entries.stream().filter(JournalEntry::isCredit).mapToLong(JournalEntry::getAmount).sum();
+    long totalDebits = entries.stream().filter(e -> !e.isCredit()).mapToLong(JournalEntry::getAmount).sum();
+    
+    // Strict enforcement of the laws of accounting
+    if (totalCredits != totalDebits) {
+        throw new LedgerImbalanceException("Debits must equal Credits. Credits: " + totalCredits + " Debits: " + totalDebits);
+    }
+    
+    // Append Only. No 'UPDATE' calls are made to any Account balance.
+    journalEntryRepository.saveAll(entries);
+}
+```
+
+## 5. Database Schema Improvements
+
+**Table: `payment_state_transitions` (Audit Trail)**
+- `id` (PK)
+- `payment_id` (FK)
+- `previous_state` (VARCHAR)
+- `new_state` (VARCHAR)
+- `reason` (VARCHAR)
+- `created_at` (TIMESTAMP)
+
+**Table: `webhook_events` (Reliability & Replay)**
+- `event_id` (Provider's ID, PK - enforces idempotency)
+- `provider` (VARCHAR - e.g., STRIPE)
+- `raw_payload` (JSONB)
+- `status` (PENDING, PROCESSED, ERROR)
+- `received_at` (TIMESTAMP)
+
+**Table: `journal_entries` (Immutable Ledger)**
+- `entry_id` (PK)
+- `transaction_id` (UUID) // Maps all correlated entries exactly 
+- `account_id` (FK)
+- `amount` (BIGINT) // Always strictly positive
+- `type` (CREDIT/DEBIT)
+- `timestamp` (TIMESTAMP) // Auditable historical chain
+
+## 6. Advanced Routing Engine
+
+The Routing Service queries internal Redis nodes for real-time sliding-window limits and speeds.
+```java
+public Provider route(PaymentRequest req, MerchantRoutingConfig conf) {
+    List<Provider> options = getAvailableProviders();
+    return options.stream()
+        .max(Comparator.comparingDouble(p -> 
+            (p.getSuccessRate() * conf.getSuccessWeight()) - 
+            (p.getLatencyMs() * conf.getLatencyWeight()) - 
+            (p.getCostBasis() * conf.getCostWeight())
+        )).orElse(fallbackProvider);
+}
+```
+
+## 7. Failure Scenarios (Sequence Diagrams)
+
+### Scenario A: Provider Timeout After Charge Success
+*Condition:* The Routing Service calls Stripe. Stripe charges the user's card successfully, but the network connection drops heavily before the HTTP 200 response reaches our Routing Service. Our system assumes failure initially.
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant PaymentSvc
-    participant ReconSvc
-    participant PayoutSvc
-    participant MerchantBank
+    participant RoutingSvc
+    participant Stripe
+    participant WebhookSvc
+    participant LedgerSvc
 
-    Client->>PaymentSvc: Charge $100
-    PaymentSvc->>PaymentSvc: Status: CAPTURED
-    Note over ReconSvc: T+2 Days Later...
-    ReconSvc->>ReconSvc: Physical Bank Settlement Received!
-    ReconSvc->>PaymentSvc: Status: SETTLED
-    Note over PayoutSvc: End of Week Scheduler triggers
-    PayoutSvc->>PayoutSvc: Aggregate Settled Funds ($100 - $3 Payout Fee)
-    PayoutSvc->>MerchantBank: Automated Wire Transfer ($97.00)
-    PayoutSvc->>PaymentSvc: Status: PAID_OUT
+    Client->>PaymentSvc: POST /v1/payments
+    PaymentSvc->>RoutingSvc: route()
+    RoutingSvc->>Stripe: charge()
+    Stripe--xRoutingSvc: Network Timeout! (Charge was actually successful)
+    RoutingSvc-->>PaymentSvc: Error (Timeout)
+    PaymentSvc->>PaymentDB: Update state (FAILED)
+    PaymentSvc-->>Client: 503 Timeout
+    
+    Note over WebhookSvc, Stripe: 2 Seconds Later
+    Stripe->>WebhookSvc: Webhook (charge.succeeded)
+    WebhookSvc->>WebhookDB: Save Raw Payload (Replay protection)
+    WebhookSvc->>Kafka: Publish Event
+    Kafka->>PaymentSvc: Consume Webhook
+    PaymentSvc->>PaymentSvc: State Machine Correction: gracefully auto-heals
+    PaymentSvc->>LedgerSvc: Trigger Ledger creation logic
+    Note over PaymentSvc, Client: System auto-heals organically via events without double charging
 ```
 
-## 3. Ledger Scalability & Sharding
-For millions of transactions daily, a monolithic PostgreSQL DB will naturally bottleneck on raw write-heavy I/O.
-- **Strategy:** Distinctly shard `journal_entries` mapped to the `merchant_account_id`.
-- **Implementation:** Hash-based algorithmic partitioning ensuring data belonging to a single merchant uniformly hits the same disk.
-- **Ordering:** Since financial equations are scoped cleanly to single merchant partitions, we enforce monotonic logical sequencing per partition.
-- **Tradeoffs Evaluation:**
-  - *Relational DBs (Postgres Sharded Matrix):* High maintenance burdens and complex schema migrations, yet ACID JOINS scaling effectively infinite on single shards natively.
-  - *Distributed SQL (Spanner):* Easiest functional scaling curve with native cross-region ACID features; susceptible to severe latency hikes parsing distributed Paxos/WAN consensuses.
-
-## 4. Adaptive Routing & ML Feedback Loop
-Instead of static logical algorithms mapping cost and latency, the **Routing Engine** evaluates real-time behaviors dynamically.
-- **Health Streaming:** Utilizing Flink/Kafka Streams constantly ingesting asynchronous `payment-events`.
-- **Autonomic Circuit Disabling:** If a provider breaches a threshold (>$15\%$ failure rate in a 1-minute tumbling window), automated circuits flip to `OPEN` disabling volume instantly.
-- **ML Overrides:** Lightweight gradient matrices predict probability outcomes against baseline historical feature vectors (`BIN`, `Amount`, `Currency`, `Time`).
-
-## 5. Defense: Rate Limiting & Fraud Layer
-- **Velocity Scanners:** Edge Gateway processes rigorous token-bucket strategies blocking irregular bulk-requests per IP or User ID metrics.
-- **Fraud Profiling Engine:** Before pushing `AUTHORIZATION`, asynchronous heuristic models check user histories. Unsafe factors instantly trigger `3D-Secure` (SCA) authentication requirements blocking bots.
-
-## 6. Schema Evolution
-- **Kafka Schema Registries (Confluent):** All microservices transmit strictly structured `payment-events` governed identically by Avro/Protobuf versions.
-- **Backward Compatibility Guidelines:** All incoming fields mutating schemas MUST be constructed explicitly as `Optional` (`default null`) to avoid dropping out-of-date Consumer parsers across legacy clusters.
-
-## 7. Disaster Recovery: Region Outage Scenarios
-*Condition:* The entire US-East data center fundamentally loses power resulting in terminal outages.
+### Scenario B: Duplicate Request Handling
+*Condition:* The Client retries the exact same checkout payload randomly due to a laggy WiFi connection.
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant GeoDNS
-    participant EUWest
-    participant USEast
-    participant GlobalDB
+    participant APIGateway
+    participant PaymentSvc
+    participant Redis
 
-    Note over USEast: COMPLETE REGION POWER OUTAGE!
-    Client->>GeoDNS: POST /payments globally
-    GeoDNS->>GeoDNS: Healthcheck inherently fails mapping US-East
-    GeoDNS->>EUWest: Route autonomous traffic organically to EU-West (Active Mode)
-    EUWest->>EUWest: Enforce Idempotency safely locally
-    EUWest->>GlobalDB: Read/Write Transactions internally
-    GlobalDB-->>EUWest: OK
-    EUWest-->>Client: 200 OK
-    Note over GlobalDB: Once US-East ultimately recovers, the logical Raft layer deterministically syncs missing blocks
+    Client->>APIGateway: POST /payments (idemp_key: "abc")
+    APIGateway->>PaymentSvc: Forward
+    PaymentSvc->>Redis: SETNX "idemp:abc" "PROCESSING"
+    Redis-->>PaymentSvc: OK
+    
+    Note over Client: Client refreshes UI out of impatience...
+    Client->>APIGateway: POST /payments (idemp_key: "abc")
+    APIGateway->>PaymentSvc: Forward
+    PaymentSvc->>Redis: SETNX "idemp:abc" "PROCESSING"
+    Redis-->>PaymentSvc: FAIL (Key already exists)
+    PaymentSvc-->>Client: 409 Conflict (Or return cached prior result)
 ```
-- **Ledger Replays:** Under extreme DB failure occurrences mapping beyond normal Multi-Region saves, the `WebhookService` holds historically permanent raw JSON traces inside Kafka cold-storage retaining 30+ day buffers able to safely replay histories recreating Ledgers accurately.
+
+### Scenario C: Reconciliation Mismatch Detection
+*Condition:* A webhook was entirely missed due to a catastrophic partial outage, and the Immutable Ledger is missing vital funds corresponding to clearing data in external bank accounts.
+
+```mermaid
+sequenceDiagram
+    participant ReconSvc
+    participant Stripe
+    participant LedgerDB
+    participant Alerting
+
+    Note over ReconSvc: Daily Scheduled CRON kicks off
+    ReconSvc->>Stripe: API Call: Fetch Settlement Report EOD
+    Stripe-->>ReconSvc: Validated CSV of all cleared charges
+    ReconSvc->>LedgerDB: Query Aggregate Sum of Journal Entries for Stripe Liability Account
+    LedgerDB-->>ReconSvc: Total = $50,000
+    Note over ReconSvc: Stripe reported $50,500
+    ReconSvc->>ReconSvc: Discrepancy detected! Analyzing transaction IDs individually
+    ReconSvc->>Alerting: PagerDuty / Slack Alert: Ledger Mismatch detected for Provider [ch_789]
+    ReconSvc->>Kafka: Trigger automated repair workflow isolating the missed event
+```
+
+## Phase 3: Global Scale Evolution
+
+### 1. Settlement & Payout Layer
+- **Flow Evolution**: The lifecycle evolves from `AUTHORIZED -> CAPTURED` to explicitly track fund movements: `AUTHORIZED -> CAPTURED -> SETTLED -> PAID_OUT`.
+- **Settlement Ledger**: When funds arrive physically (usually T+2 days), the `ReconciliationService` marks the `CAPTURED` ledger journals as `SETTLED`.
+- **Payout Service**: A dedicated service polls `SETTLED` merchants in batches. It aggregates funds, subtracts our internal processing fees, and executes asynchronous payouts (ACH/Wire) via external Banking APIs, marking the status `PAID_OUT`. Retries are handled via partitioned DLQ (Dead Letter Queue) processing to avoid failing entire batches.
+
+### 2. Multi-Region Design (Active-Active)
+- **Architecture**: Core clusters run in US-East, EU-West, and AP-South concurrently. Route53 Geo-DNS routes users logically. 
+- **Global Idempotency**: Anti-entropy requires Redis Enterprise with global CRDTs (Conflict-free Replicated Data Types). If US-East evaluates `idempotency_key_A`, EU-West instantly knows to reject duplicates.
+- **Cross-Region Replication**: Asynchronous events sync across continents using Kafka MirrorMaker2. Synchronous financial states leverage Spanner or CockroachDB utilizing globally dispersed Paxos consensus for true ACID compliance.
+
+### 3. Ledger Scalability & Data Sharding
+- **Sharding Strategy**: Monolithic ledgers bottleneck rapidly. We shard the `journal_entries` table exclusively by `merchant_account_id` utilizing Hash Partitioning.
+- **High Throughput**: Entire multi-layer financial transactions (fees, merchant credits, platform debits) logically fall into the exact same localized shard. This prevents cross-shard distributed lock contention entirely, scaling throughput linearly.
+- **Tradeoffs**:
+  - *Distributed SQL (Spanner)*: Hands-free linear scalability, but higher cross-region write tail latency (WAN p99s).
+  - *Relational Sharded (Postgres/Vitess)*: Exceptional local ACID read/write latency, but massive operational overhead managing routing proxies and custom schema evolution tooling.
+
+### 4. Distributed Idempotency (End-to-End)
+- **API Boundary**: Redis CRDT distributed token checking blocks duplicate `POST /payments`.
+- **Kafka Consumers**: All Kafka producers enforce `enable.idempotence=true`. Downstream consumers cache unique `event_id` strings inside a Postgres `processed_events` table natively within the SAME relational database transaction updating the payment state! This guarantees exactly-once processing safely.
+
+### 5. Disaster Recovery
+- **Region Outage Scenarios**: If US-East loses structural power, Global Accelerator inherently routes to EU-West. EU-West's Redis globally evaluates previous keys to strictly block double charges in transition.
+- **Ledger Reconstruction**: The `WebhookService` holds all historical immutable JSON arrays in durable Kafka Compact topics or S3 object stores. If a local Ledger shard fatally corrupts, we can deterministically recreate the exact account balances from the beginning of time simply by replaying the source events sequentially.
+
+### 6. Fraud & Rate Limiting Layer
+- **Velocity Checks**: Edge Gateways enforce globally-synced Redis token buckets to rate limit `merchant_id` anomalies or erratic IP-subnet request loops.
+- **Risk Scoring Pipeline**: Before the static `AUTHORIZATION` runs, an asynchronous ML pipeline evaluates request heuristics (Device ID fingerprints, velocity, IP ASN routing). Any flags dynamically trigger frictionless `3D-Secure` (SCA / Verified by Visa) authentications, aggressively blocking synthetic bot checkouts.
