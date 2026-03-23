@@ -24,7 +24,7 @@ public class StripeAdapter implements PaymentProvider {
         return PaymentResponse.builder()
                 .paymentId("ch_" + System.currentTimeMillis())
                 .provider(getProviderName())
-                .status(PaymentStatus.SUCCEEDED)
+                .status(PaymentStatus.CAPTURED)
                 .amount(request.getAmount())
                 .currency(request.getCurrency())
                 .createdAt(LocalDateTime.now())

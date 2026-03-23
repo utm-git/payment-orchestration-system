@@ -45,7 +45,7 @@ public class PaymentControllerTest {
 
         PaymentResponse response = PaymentResponse.builder()
                 .paymentId("pay_123")
-                .status(PaymentStatus.SUCCEEDED)
+                .status(PaymentStatus.CAPTURED)
                 .provider("STRIPE")
                 .amount(5000L)
                 .currency("USD")
@@ -57,7 +57,7 @@ public class PaymentControllerTest {
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.status").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.status").value("CAPTURED"))
                 .andExpect(jsonPath("$.provider").value("STRIPE"));
     }
 }

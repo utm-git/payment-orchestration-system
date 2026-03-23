@@ -15,5 +15,4 @@ public class Account {
     private String id;
     private String name;
     private String type;
-    private Long balance;
 }

@@ -5,6 +5,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 @RestController
 @RequestMapping("/v1/webhooks")
@@ -13,6 +15,8 @@ import org.springframework.web.bind.annotation.*;
 public class WebhookController {
 
     private final PaymentEventProducer eventProducer;
+    private final WebhookEventRepository webhookEventRepository;
+    private final ObjectMapper objectMapper;
 
     @PostMapping("/{provider}")
     public ResponseEntity<Void> handleWebhook(
@@ -21,22 +25,34 @@ public class WebhookController {
             @RequestHeader(value = "X-Razorpay-Signature", required = false) String razorpaySignature,
             @RequestBody String payload) {
             
-        log.info("Received webhook from provider: {}", provider);
-        
-        // In a real implementation: verify the cryptographic signature depending on the provider
-        boolean isValidSignature = verifySignature(provider, stripeSignature, razorpaySignature, payload);
-        if (!isValidSignature) {
-            log.warn("Invalid signature from provider: {}", provider);
+        try {
+            JsonNode payloadNode = objectMapper.readTree(payload);
+            String eventId = payloadNode.has("id") ? payloadNode.get("id").asText() : java.util.UUID.randomUUID().toString();
+            
+            log.info("Received webhook from provider: {} with eventId: {}", provider, eventId);
+            
+            if (webhookEventRepository.existsById(eventId)) {
+                log.info("Idempotent replay detected for eventId: {}. Skipping.", eventId);
+                return ResponseEntity.ok().build();
+            }
+
+            // Save raw payload idempotently
+            WebhookEvent event = new WebhookEvent();
+            event.setEventId(eventId);
+            event.setProvider(provider);
+            event.setRawPayload(payload);
+            event.setStatus("PENDING");
+            webhookEventRepository.save(event);
+
+            // Publish to Kafka for asynchronous processing accurately
+            eventProducer.publishWebhookEvent(provider, payload);
+            
+            event.setStatus("PROCESSED");
+            webhookEventRepository.save(event);
+            return ResponseEntity.accepted().build();
+        } catch (Exception e) {
+            log.error("Failed to parse webhook", e);
             return ResponseEntity.badRequest().build();
         }
-
-        // Publish to Kafka for asynchronous processing
-        eventProducer.publishWebhookEvent(provider, payload);
-        
-        return ResponseEntity.accepted().build();
-    }
-    
-    private boolean verifySignature(String provider, String stripeSig, String rzpSig, String payload) {
-        return true;
     }
 }
