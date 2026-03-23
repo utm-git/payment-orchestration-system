@@ -14,6 +14,7 @@ com/payments/event/PaymentEventConsumer.class
 com/payments/core/repository/PaymentStateTransitionRepository.class
 com/payments/core/model/PaymentStateTransition.class
 com/payments/ledger/model/Transaction.class
+com/payments/security/FraudScoringService.class
 com/payments/ledger/model/Account.class
 com/payments/core/repository/PaymentRepository.class
 com/payments/core/service/PaymentService.class
@@ -28,3 +29,5 @@ com/payments/ledger/service/LedgerService.class
 com/payments/ledger/repository/JournalEntryRepository.class
 com/payments/ledger/repository/AccountRepository.class
 com/payments/core/controller/PaymentController.class
+com/payments/reconciliation/PayoutService.class
+com/payments/idempotency/DistributedIdempotencyStore.class
