@@ -23,8 +23,11 @@ public class LedgerService {
     private final JournalEntryRepository journalEntryRepository;
 
     @Transactional
-    public void recordPaymentSucceeded(String paymentId, Long amount, String currency, String merchantAccountId, String providerAccountId) {
-        log.info("Recording ledger entries for successful payment {}", paymentId);
+    public void recordPaymentCaptured(String paymentId, Long amount, String currency, String merchantAccountId, String providerAccountId) {
+        log.info("Recording append-only ledger entries for successful payment capture {}", paymentId);
+        
+        ensureAccountExists(providerAccountId, "ASSET");
+        ensureAccountExists(merchantAccountId, "LIABILITY");
         
         // 1. Transaction
         Transaction tx = new Transaction();
@@ -43,7 +46,6 @@ public class LedgerService {
         debitEntry.setDirection("DEBIT");
         debitEntry.setAmount(amount);
         journalEntryRepository.save(debitEntry);
-        updateAccountBalance(providerAccountId, amount, "DEBIT");
 
         // 3. Journal Entry - CREDIT Merchant Account (Liability)
         JournalEntry creditEntry = new JournalEntry();
@@ -53,24 +55,15 @@ public class LedgerService {
         creditEntry.setDirection("CREDIT");
         creditEntry.setAmount(amount);
         journalEntryRepository.save(creditEntry);
-        updateAccountBalance(merchantAccountId, amount, "CREDIT");
     }
-
-    private void updateAccountBalance(String accountId, Long amount, String direction) {
-        Account account = accountRepository.findById(accountId).orElseGet(() -> {
+    
+    private void ensureAccountExists(String accountId, String defaultType) {
+        accountRepository.findById(accountId).orElseGet(() -> {
             Account newAcc = new Account();
             newAcc.setId(accountId);
             newAcc.setName(accountId);
-            newAcc.setType("LIABILITY");
-            newAcc.setBalance(0L);
+            newAcc.setType(defaultType);
             return accountRepository.save(newAcc);
         });
-
-        if ("CREDIT".equals(direction)) {
-            account.setBalance(account.getBalance() + amount);
-        } else if ("DEBIT".equals(direction)) {
-            account.setBalance(account.getBalance() - amount);
-        }
-        accountRepository.save(account);
     }
 }

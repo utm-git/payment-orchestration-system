@@ -31,15 +31,18 @@ public class RoutingEngineTest {
     }
 
     @Test
-    public void testFallbackToRazorpay() {
+    public void testDynamicRoutingToStripe() {
         Payment payment = new Payment();
         payment.setId(UUID.randomUUID().toString());
         PaymentRequest req = new PaymentRequest();
         
-        PaymentResponse rzpResponse = PaymentResponse.builder().provider("RAZORPAY").build();
-        when(razorpayAdapter.charge(any())).thenReturn(rzpResponse);
+        when(stripeAdapter.getProviderName()).thenReturn("STRIPE");
+        when(razorpayAdapter.getProviderName()).thenReturn("RAZORPAY");
         
-        PaymentResponse response = routingEngine.fallbackToRazorpay(payment, req, new RuntimeException("Timeout"));
-        assertEquals("RAZORPAY", response.getProvider());
+        PaymentResponse strResponse = PaymentResponse.builder().provider("STRIPE").build();
+        when(stripeAdapter.charge(any())).thenReturn(strResponse);
+        
+        PaymentResponse response = routingEngine.routeAndProcess(payment, req);
+        assertEquals("STRIPE", response.getProvider());
     }
 }

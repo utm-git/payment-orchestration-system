@@ -31,10 +31,10 @@ public class LedgerServiceTest {
     private LedgerService ledgerService;
 
     @Test
-    public void testRecordPaymentSucceeded() {
+    public void testRecordPaymentCaptured() {
         when(accountRepository.findById(anyString())).thenReturn(Optional.empty());
 
-        ledgerService.recordPaymentSucceeded("pay_123", 1000L, "USD", "merch_1", "prov_1");
+        ledgerService.recordPaymentCaptured("pay_123", 1000L, "USD", "merch_1", "prov_1");
 
         verify(transactionRepository, times(1)).save(any(Transaction.class));
         verify(journalEntryRepository, times(2)).save(any(JournalEntry.class));
