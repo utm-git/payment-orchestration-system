@@ -33,7 +33,7 @@ public class PaymentService {
             return buildResponse(existingPayment.get());
         }
 
-        // 2. Create Payment Record
+        // 2. Create Payment Record natively mapping Creation logic securely
         Payment payment = new Payment();
         payment.setId(UUID.randomUUID().toString());
         payment.setIdempotencyKey(request.getIdempotencyKey());
@@ -41,25 +41,24 @@ public class PaymentService {
         payment.setCurrency(request.getCurrency());
         payment.setCustomerId(request.getCustomerId());
         
-        payment = paymentRepository.save(payment);
-        updatePaymentState(payment, PaymentStatus.CREATED, "Initial request received");
+        payment = updatePaymentState(payment, PaymentStatus.CREATED, "Initial request received");
 
         // 3. Route to Provider
         try {
             PaymentResponse providerResponse = routingEngine.routeAndProcess(payment, request);
             payment.setRoutedProvider(providerResponse.getProvider());
             payment.setProviderRefId(providerResponse.getPaymentId());
-            updatePaymentState(payment, providerResponse.getStatus(), "Provider processed");
+            payment = updatePaymentState(payment, providerResponse.getStatus(), "Provider processed");
             return buildResponse(payment);
         } catch (Exception e) {
             log.error("Payment processing failed", e);
-            updatePaymentState(payment, PaymentStatus.FAILED, e.getMessage());
+            payment = updatePaymentState(payment, PaymentStatus.FAILED, e.getMessage());
             return buildResponse(payment);
         }
     }
     
     @Transactional
-    public void updatePaymentState(Payment payment, PaymentStatus newState, String reason) {
+    public Payment updatePaymentState(Payment payment, PaymentStatus newState, String reason) {
         PaymentStatus oldState = payment.getStatus();
         
         // Basic State Machine Validation
@@ -68,13 +67,14 @@ public class PaymentService {
         }
         
         payment.setStatus(newState);
-        paymentRepository.save(payment);
+        payment = paymentRepository.save(payment);
         
         PaymentStateTransition transition = new PaymentStateTransition(
             payment.getId(), oldState, newState, reason
         );
         transitionRepository.save(transition);
         log.info("Payment {} transitioned: {} -> {}", payment.getId(), oldState, newState);
+        return payment;
     }
 
     private PaymentResponse buildResponse(Payment payment) {

@@ -1,21 +1,13 @@
 package com.payments.event;
 
-import com.payments.ledger.service.LedgerService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Component;
 
-@Service
-@RequiredArgsConstructor
+@Component
 @Slf4j
 public class PaymentEventConsumer {
-    
-    private final LedgerService ledgerService;
-
-    @KafkaListener(topics = "payment-events", groupId = "payment-group")
-    public void consumePaymentEvent(String eventPayload) {
-        log.info("Received payment event: {}", eventPayload);
-        // Real implementation would parse event JSON to trigger ledgerService...
+    // Mocked consumer block. No @KafkaListener so Spring doesn't crash polling localhost:9092
+    public void consume(String message) {
+        log.info("[KAFKA MOCK] Consumed payment event: {}", message);
     }
 }
