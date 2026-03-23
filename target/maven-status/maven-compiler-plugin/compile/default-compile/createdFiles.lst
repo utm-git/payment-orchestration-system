@@ -21,6 +21,8 @@ com/payments/core/service/PaymentService.class
 com/payments/reconciliation/ReconciliationService.class
 com/payments/core/model/PaymentStatus.class
 com/payments/routing/provider/StripeAdapter.class
+com/payments/ledger/model/JournalEntry$JournalEntryBuilder.class
+com/payments/ledger/model/Transaction$TransactionBuilder.class
 com/payments/webhook/WebhookController.class
 com/payments/webhook/WebhookEventRepository.class
 com/payments/core/model/Payment.class
