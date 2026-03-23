@@ -10,10 +10,13 @@ import com.payments.core.repository.PaymentStateTransitionRepository;
 import com.payments.routing.RoutingEngine;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 @Service
@@ -25,25 +28,45 @@ public class PaymentService {
     private final PaymentStateTransitionRepository transitionRepository;
     private final RoutingEngine routingEngine;
 
+    /**
+     * Fix 8: Explicit forward-only transition allowlist.
+     * Only these (fromState -> toStates) pairs are legal.
+     * Any other transition throws IllegalStateException immediately.
+     * Fix 3: FAILED -> CAPTURED is legal to allow webhook-driven auto-healing.
+     */
+    private static final Map<PaymentStatus, Set<PaymentStatus>> ALLOWED_TRANSITIONS = Map.of(
+        PaymentStatus.CREATED,    Set.of(PaymentStatus.AUTHORIZED, PaymentStatus.FAILED),
+        PaymentStatus.AUTHORIZED, Set.of(PaymentStatus.CAPTURED, PaymentStatus.FAILED),
+        PaymentStatus.CAPTURED,   Set.of(PaymentStatus.SETTLED, PaymentStatus.REFUNDED, PaymentStatus.FAILED),
+        PaymentStatus.FAILED,     Set.of(PaymentStatus.CAPTURED), // Fix 3: webhook healing from FAILED -> CAPTURED
+        PaymentStatus.SETTLED,    Set.of(PaymentStatus.PAID_OUT),
+        PaymentStatus.REFUNDED,   Set.of(),
+        PaymentStatus.PAID_OUT,   Set.of()
+    );
+
     @Transactional
     public PaymentResponse processPayment(PaymentRequest request) {
-        // 1. Check idempotency
+        // Idempotency: attempt DB insert, handle UNIQUE constraint violation cleanly
         Optional<Payment> existingPayment = paymentRepository.findByIdempotencyKey(request.getIdempotencyKey());
         if (existingPayment.isPresent()) {
+            log.info("Idempotent request detected for key {}. Returning cached response.", request.getIdempotencyKey());
             return buildResponse(existingPayment.get());
         }
 
-        // 2. Create Payment Record natively mapping Creation logic securely
         Payment payment = new Payment();
         payment.setId(UUID.randomUUID().toString());
         payment.setIdempotencyKey(request.getIdempotencyKey());
         payment.setAmount(request.getAmount());
         payment.setCurrency(request.getCurrency());
         payment.setCustomerId(request.getCustomerId());
-        
-        payment = updatePaymentState(payment, PaymentStatus.CREATED, "Initial request received");
 
-        // 3. Route to Provider
+        try {
+            payment = updatePaymentState(payment, PaymentStatus.CREATED, "Initial request received");
+        } catch (DataIntegrityViolationException ex) {
+            // Concurrent request with same idempotency key won the DB race — return their result
+            return buildResponse(paymentRepository.findByIdempotencyKey(request.getIdempotencyKey()).orElseThrow());
+        }
+
         try {
             PaymentResponse providerResponse = routingEngine.routeAndProcess(payment, request);
             payment.setRoutedProvider(providerResponse.getProvider());
@@ -56,19 +79,22 @@ public class PaymentService {
             return buildResponse(payment);
         }
     }
-    
+
     @Transactional
     public Payment updatePaymentState(Payment payment, PaymentStatus newState, String reason) {
         PaymentStatus oldState = payment.getStatus();
-        
-        // Basic State Machine Validation
-        if (oldState == PaymentStatus.FAILED || oldState == PaymentStatus.REFUNDED) {
-            throw new IllegalStateException("Cannot transition from terminal state " + oldState);
+
+        // Fix 8: Validate against explicit allowlist — backward transitions are impossible
+        Set<PaymentStatus> allowed = ALLOWED_TRANSITIONS.getOrDefault(oldState, Set.of());
+        if (!allowed.contains(newState)) {
+            throw new IllegalStateException(
+                String.format("Invalid state transition: %s -> %s is not permitted.", oldState, newState)
+            );
         }
-        
+
         payment.setStatus(newState);
         payment = paymentRepository.save(payment);
-        
+
         PaymentStateTransition transition = new PaymentStateTransition(
             payment.getId(), oldState, newState, reason
         );

@@ -34,7 +34,7 @@ public class LedgerServiceTest {
     public void testRecordPaymentCaptured() {
         when(accountRepository.findById(anyString())).thenReturn(Optional.empty());
 
-        ledgerService.recordPaymentCaptured("pay_123", 1000L, "USD", "merch_1", "prov_1");
+        ledgerService.recordPaymentCaptured("pay_123", new java.math.BigDecimal("1000"), "USD", "merch_1", "prov_1");
 
         verify(transactionRepository, times(1)).save(any(Transaction.class));
         verify(journalEntryRepository, times(2)).save(any(JournalEntry.class));

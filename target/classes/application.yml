@@ -13,8 +13,10 @@ spring:
     show-sql: true
   h2:
     console:
-      enabled: true
-      path: /h2-console
+      enabled: false   # Security fix: never expose DB console in any environment
+  sql:
+    init:
+      mode: always
   kafka:
     bootstrap-servers: localhost:9092
     producer:
